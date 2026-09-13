@@ -1,0 +1,198 @@
+# Send a beta build to the players. Run by hand, never on a trigger.
+#
+#   source   fishbill88/TaskTopFight            builds on every push to main
+#   beta     fishbill88/TTF-Beta-Release        ← you are here. Testers poll this
+#   stable   fishbill88/TaskTopFight-Release    everyone else polls this
+#
+# This workflow is the ONLY door between the second row and the third. It takes
+# a release that already exists here, copies its four assets across verbatim,
+# and publishes them there under the same version.
+#
+# ── why a copy, and not another build ────────────────────────────────────────
+# Rebuilding from the tag would produce a DIFFERENT installer: a fresh npm
+# install resolves new transitive versions, and the sha512 in latest.yml is of
+# one specific file. The bytes the testers signed off on are the bytes the
+# players should get, so nothing is compiled here — the four files come down
+# and go up unchanged.
+#
+# That is also why latest.yml survives the trip untouched. It names the
+# installer by FILENAME and carries its hash and size; it says nothing about
+# which repository it came from, so the same file is a correct feed on both.
+#
+# ── one-time setup ───────────────────────────────────────────────────────────
+# The built-in GITHUB_TOKEN reads this repo and cannot write to another one, so:
+#
+#   1. make a fine-grained PAT with Contents: read & write on
+#      fishbill88/TaskTopFight-Release
+#   2. add it to THIS repo as the TASKTOPFIGHT_RELEASE_TOKEN secret
+#
+# (The source repo has a secret of the same name. They are different scopes —
+# that one writes the beta repo, this one writes stable — and one PAT covering
+# both repos is fine if you would rather keep a single secret.)
+#
+# ── running it ───────────────────────────────────────────────────────────────
+# Actions → promote → Run workflow. Leave the version blank to promote the
+# newest beta, or type one (0.4.7, no leading v) to promote an older build that
+# turned out to be the good one.
+
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Leave blank for the newest beta. Or set one: 0.4.7, three parts, no leading v'
+        required: false
+        type: string
+      notes:
+        description: 'Release notes for players. Blank uses a plain default.'
+        required: false
+        type: string
+
+# One promotion at a time. Two runs racing would both find the stable repo
+# without this version and both try to create it; the loser dies partway through
+# uploading, which leaves players a release holding an installer and no feed.
+concurrency:
+  group: tasktopfight-promote
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Work out WHICH beta build is being promoted ─────────────────────
+      # Blank means the newest, which is the common case: a beta landed, the
+      # testers are happy, you want that one out. A typed version is for the
+      # other case — beta has moved on since the build that was actually good.
+      #
+      # "Newest" is read from the release list rather than from `--latest`,
+      # sorted numerically per field. Same arithmetic as the source repo's
+      # release.yml and for the same reason: sort -V is a GNU extension and
+      # three -k flags are not worth a dependency. Drafts are skipped — a draft
+      # is debris from a failed publish, never something to ship.
+      - name: Pick the build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BETA=${{ github.repository }}
+          V="${{ inputs.version }}"
+
+          if [ -z "$V" ]; then
+            V=$(gh api "repos/$BETA/releases" --paginate --jq '.[] | select(.draft == false) | .tag_name' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+            if [ -z "$V" ]; then
+              echo "::error::there are no published betas in $BETA to promote."
+              exit 1
+            fi
+            echo "newest beta is $V"
+          fi
+
+          V="${V#v}"
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$V' is not a version. Wanted MAJOR.MINOR.PATCH — three parts, no leading v, e.g. 0.4.7."
+            exit 1
+          fi
+
+          # It has to exist HERE before anything else happens. Typing a version
+          # that was never built is the likeliest mistake this workflow sees,
+          # and finding out at the download step means a half-explained failure
+          # three steps in.
+          if ! gh release view "v$V" --repo "$BETA" >/dev/null 2>&1; then
+            echo "::error::v$V is not a published release on $BETA. The Releases tab lists what there is to promote."
+            exit 1
+          fi
+
+          echo "TTF_VERSION=$V" >> "$GITHUB_ENV"
+          echo "### Promoting \`v$V\` to players" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 2. Refuse before downloading 90 MB, if it is already out ───────────
+      # A published release on stable may already be installed on people's
+      # machines, so this never clobbers one. Checked here rather than at the
+      # upload so a mistaken re-run costs a few seconds instead of a build's
+      # worth of transfer.
+      - name: Make sure it is not already out
+        env:
+          GH_TOKEN: ${{ secrets.TASKTOPFIGHT_RELEASE_TOKEN }}
+        run: |
+          STABLE=fishbill88/TaskTopFight-Release
+          if gh release view "v$TTF_VERSION" --repo "$STABLE" >/dev/null 2>&1; then
+            echo "::error::v$TTF_VERSION is already published on $STABLE. Promote a newer beta, or delete that release first if it was a bad one."
+            exit 1
+          fi
+
+          # Drafts under this version are debris from a promotion that failed
+          # partway. A draft owns no tag and nothing can be pointing at one, so
+          # clearing them keeps the create below unambiguous. Published releases
+          # are never touched here.
+          gh api "repos/$STABLE/releases" --paginate --jq ".[] | select(.draft and .tag_name == \"v$TTF_VERSION\") | .id" | while read -r id; do
+            echo "removing stale draft $id"
+            gh api -X DELETE "repos/$STABLE/releases/$id"
+          done
+
+      # ── 3. Take the bytes ──────────────────────────────────────────────────
+      - name: Download the beta assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          gh release download "v$TTF_VERSION" --repo "${{ github.repository }}" --dir dist
+          ls -l dist
+
+      # ── 4. All four or nothing ─────────────────────────────────────────────
+      # The updater needs three of these TOGETHER — the installer, latest.yml
+      # (the feed it polls) and the .blockmap (so an update fetches only changed
+      # blocks). A stable release carrying an installer but no latest.yml is not
+      # a partial success; it is a broken feed that every installed copy is
+      # already polling. The room server zip rides along because a stamped
+      # client is rejected at join by a server built from different source.
+      #
+      # latest.yml is READ, not just counted: it is the file that decides what
+      # every installed copy downloads, so a feed naming a version other than
+      # the one being promoted would quietly send players somewhere else.
+      - name: Check the set is complete
+        run: |
+          cd dist
+          EXE="TaskTopFight-Setup-$TTF_VERSION.exe"
+          SRV="TaskTopFight-RoomServer-$TTF_VERSION.zip"
+          for f in "$EXE" "$EXE.blockmap" latest.yml "$SRV"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::the beta release is missing $f — refusing to publish a partial release to players"
+              exit 1
+            fi
+          done
+
+          FEED_V=$(sed -n 's/^version: *//p' latest.yml | tr -d '\r' | head -1)
+          if [ "$FEED_V" != "$TTF_VERSION" ]; then
+            echo "::error::latest.yml says version $FEED_V but this is v$TTF_VERSION. That feed would point players at the wrong build."
+            exit 1
+          fi
+          if ! grep -q "$EXE" latest.yml; then
+            echo "::error::latest.yml does not name $EXE. The feed and the installer beside it do not match."
+            exit 1
+          fi
+          echo "four files, feed says $FEED_V"
+
+      # ── 5. Publish to players ──────────────────────────────────────────────
+      # --latest is the switch that actually ships it: it is what the updater
+      # resolves, so until this line runs the build is downloadable from the
+      # beta repo and reaches nobody who has not opted in.
+      - name: Publish to the stable release repo
+        env:
+          GH_TOKEN: ${{ secrets.TASKTOPFIGHT_RELEASE_TOKEN }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          STABLE=fishbill88/TaskTopFight-Release
+          EXE="TaskTopFight-Setup-$TTF_VERSION.exe"
+          SRV="TaskTopFight-RoomServer-$TTF_VERSION.zip"
+          cd dist
+
+          if [ -z "$NOTES" ]; then
+            NOTES="Windows installer. The app updates itself from here — see the README."
+          fi
+
+          gh release create "v$TTF_VERSION" --repo "$STABLE" --title "$TTF_VERSION" --notes "$NOTES" --latest "$EXE" "$EXE.blockmap" latest.yml "$SRV"
+
+          echo "promoted v$TTF_VERSION — installed copies on the stable feed pick it up within ten minutes" >> "$GITHUB_STEP_SUMMARY"
